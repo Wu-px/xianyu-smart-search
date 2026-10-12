@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 浏览器登录态（本机私有，勿提交）
+browser_profile/
+
+# Node
+node_modules/
+
+# 系统
+.DS_Store
+Thumbs.db

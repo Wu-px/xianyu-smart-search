@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>闲鱼智能搜索助手</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="logo">🐟 闲鱼智能搜索助手</div>
+  <div class="subtitle">输入关键词 + 收货地址，自动搜索闲鱼，按性价比帮你挑好货</div>
+</header>
+
+<!-- 第一步：登录 -->
+<section class="panel" id="login-panel">
+  <div class="panel-title">第 1 步 · 登录闲鱼 <span class="status-dot" id="login-dot"></span> <span id="login-text">检测中…</span></div>
+  <div class="panel-body">
+    <button class="btn primary" id="btn-login">打开闲鱼网页并登录</button>
+    <button class="btn" id="btn-refresh">刷新登录状态</button>
+    <button class="btn danger hidden" id="btn-stop">关闭浏览器</button>
+    <p class="hint" id="login-hint">点击按钮后会打开一个浏览器窗口并访问闲鱼网页版，请在窗口内扫码 / 密码登录。登录态只保存在本机，不会上传。</p>
+  </div>
+</section>
+
+<!-- 第二步：搜索 -->
+<section class="panel">
+  <div class="panel-title">第 2 步 · 搜索</div>
+  <div class="panel-body search-bar">
+    <input type="text" id="kw" placeholder="输入想要搜索的商品关键词，如：索尼 A7M3">
+    <input type="text" id="city" list="city-list" placeholder="收货城市，如：杭州" class="addr">
+    <datalist id="city-list">
+      <option>北京</option><option>上海</option><option>广州</option><option>深圳</option>
+      <option>杭州</option><option>成都</option><option>武汉</option><option>南京</option>
+      <option>苏州</option><option>重庆</option><option>西安</option><option>长沙</option>
+    </datalist>
+    <input type="text" id="district" placeholder="区县（选填），如：西湖区" class="addr">
+    <button class="btn primary big" id="btn-search">🔍 智能搜索</button>
+  </div>
+  <p class="hint">未登录也能搜索（可能内容不全）；真实抓取失败时会自动切换演示数据，界面右下角会标注数据来源。</p>
+</section>
+
+<!-- 结果区 -->
+<section id="results" class="hidden">
+  <div class="result-head">
+    <div>
+      <span class="result-count" id="result-count"></span>
+      <span class="badge source" id="source-badge"></span>
+    </div>
+    <div class="sort-tabs" id="sort-tabs">
+      <button data-sort="value" class="active">综合性价比</button>
+      <button data-sort="price">价格最低</button>
+      <button data-sort="distance">距离最近</button>
+      <button data-sort="condition">品相最新</button>
+    </div>
+  </div>
+  <div id="card-list"></div>
+</section>
+
+<footer class="footer">
+  评分维度：价格(30) 品相(20) 卖家信誉(15) 个人卖家(10) 文案质量(10) 自提距离(10) 上线时间(5) · 超过 10 天未上线的卖家固定排在最后
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
