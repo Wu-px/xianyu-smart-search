@@ -3,14 +3,16 @@
 设计思路：
 1. 用 Playwright 以「持久化上下文 + 有头模式」启动 Chromium，用户手动扫码登录一次，
    登录态保存在 ./browser_profile 目录中，之后搜索直接复用，无需重复登录。
+   （实测无头模式会被闲鱼风控直接拦截，必须真人登录建立信任态。）
 2. 不依赖易变的 DOM 结构，而是通过 page.on("response") 拦截闲鱼前端自己调用的
-   mtop 接口（搜索 / 详情 / 卖家主页），直接拿到结构化 JSON，页面前端改版时更稳健。
-3. 全部解析做容错：字段缺失记 None，交给评分模块降级处理；
+   mtop 接口（搜索 / 详情），直接拿结构化 JSON，页面前端改版时更稳健。
+3. 卖家信息（昵称 / 最近上线 / 在售数 / 芝麻认证 / 已售数）直接来自详情接口的
+   sellerDO 字段，不再逐个访问卖家主页，速度快一个数量级且更稳定。
+4. 全部解析做容错：字段缺失记 None，交给评分模块降级处理；
    完全抓不到数据时抛 ScrapeError，由上层自动回退到演示数据，保证演示一定能跑通。
 """
 from __future__ import annotations
 
-import json
 import os
 import re
 import threading
@@ -23,9 +25,12 @@ from playwright.sync_api import sync_playwright
 BASE = "https://www.goofish.com"
 PROFILE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "browser_profile"))
 
-SEARCH_BUDGET_SECONDS = 240     # 一次搜索的总时间预算
-DETAIL_PAGE_LIMIT = 14          # 对前 N 个商品抓详情 / 卖家主页
+SEARCH_BUDGET_SECONDS = 180     # 一次搜索的总时间预算
+DETAIL_PAGE_LIMIT = 14          # 对前 N 个商品抓详情
 SCROLL_ROUNDS = 6               # 搜索页滚动轮数，尽量多加载结果
+
+# 登录后闲鱼域名下必然存在的 Cookie 名（用于登录态兜底判断）
+LOGIN_COOKIE_NAMES = {"unb", "cookie2", "_tb_token_", "sgcookie"}
 
 
 class ScrapeError(RuntimeError):
@@ -72,20 +77,55 @@ def _fix_url(u: str | None) -> str | None:
         return None
     if u.startswith("//"):
         return "https:" + u
+    if u.startswith("http://"):
+        return "https://" + u[len("http://"):]
     return u
 
 
-def _is_search_item(d: dict) -> bool:
-    return isinstance(d.get("title"), str) and any(
-        k in d for k in ("price", "priceWap", "priceString", "salePrice")
-    )
+def _parse_last_visit(text: str) -> float | None:
+    """解析 sellerDO.lastVisitTime，如 「13分钟前来过」「昨天来过」「3天前来过」→ 天数。"""
+    if not text:
+        return None
+    if re.search(r"分钟|小时|刚刚", text) or "今天" in text:
+        return 0.0
+    if "昨天" in text:
+        return 1.0
+    m = re.search(r"(\d+)\s*天", text)
+    if m:
+        return float(m.group(1))
+    m = re.search(r"(\d+)\s*周", text)
+    if m:
+        return float(m.group(1)) * 7
+    m = re.search(r"(\d+)\s*个月", text)
+    if m:
+        return float(m.group(1)) * 30
+    return None
 
 
-def _is_detail(d: dict) -> bool:
-    desc = _first(d, ["desc", "description", "itemDesc"])
-    return isinstance(desc, str) and len(desc) >= 10 and any(
-        k in d for k in ("pics", "images", "picList", "photos")
-    )
+def _is_search_card(d: dict) -> bool:
+    """搜索结果商品卡片：必有 itemId + title，价格可能是富文本 spans 或在 detailParams 里。"""
+    if not (isinstance(d.get("title"), str) and d.get("itemId")):
+        return False
+    return "price" in d or "soldPrice" in (d.get("detailParams") or {})
+
+
+def _card_price(raw: dict) -> float | None:
+    p = _parse_price((raw.get("detailParams") or {}).get("soldPrice"))
+    if p is not None:
+        return p
+    spans = raw.get("price")
+    if isinstance(spans, list):  # 富文本价格：[{'text':'¥'},{'text':'18'}]
+        text = "".join(str(s.get("text", "")) for s in spans if isinstance(s, dict))
+        return _parse_price(text)
+    return _parse_price(spans)
+
+
+def _safe_json(resp) -> dict | None:
+    try:
+        data = resp.json()
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------- 会话管理
@@ -150,28 +190,26 @@ class XianyuSession:
     # ---- 登录状态 ----
 
     def login_status(self) -> dict:
-        """通过闲鱼自己的登录态接口判断（未登录返回 SESSION_EXPIRED），
-        比看页面 URL 可靠——personal_page 未登录时返回 404 而非跳登录页。"""
+        """优先看闲鱼登录态接口的返回，不确定时兜底检查登录 Cookie。"""
         if self._context is None:
             return {"running": False, "logged_in": False}
         page = self._page
         captured: list[dict] = []
 
         def on_resp(resp):
-            try:
-                j = resp.json()
-                if isinstance(j, dict):
-                    captured.append(j)
-            except Exception:
-                pass
+            j = _safe_json(resp)
+            if j is not None:
+                captured.append(j)
 
         page.on("response", on_resp)
         try:
             page.goto(BASE + "/", wait_until="domcontentloaded", timeout=20000)
             page.wait_for_timeout(3500)
+            saw_login_api = False
             for j in captured:
                 api = str(j.get("api", ""))
                 if "loginuser" in api or "user.page.nav" in api:
+                    saw_login_api = True
                     ret = ",".join(j.get("ret") or [])
                     if "SUCCESS" in ret:
                         nick = None
@@ -181,11 +219,13 @@ class XianyuSession:
                                 nick = str(data[k])
                                 break
                         return {"running": True, "logged_in": True, "nick": nick}
-                    if "SESSION_EXPIRED" in ret or "TOKEN" in ret:
-                        return {"running": True, "logged_in": False}
+            # 接口未明确返回（token 过期等常见）：看登录 Cookie 兜底
+            cookies = self._context.cookies(BASE)
+            names = {c.get("name") for c in cookies}
+            logged = bool(names & LOGIN_COOKIE_NAMES)
+            return {"running": True, "logged_in": logged}
         except Exception:
-            pass
-        return {"running": True, "logged_in": False}
+            return {"running": True, "logged_in": False}
 
     # ---- 搜索 ----
 
@@ -195,18 +235,12 @@ class XianyuSession:
             raise ScrapeError("浏览器未启动")
         deadline = time.time() + SEARCH_BUDGET_SECONDS
         page = self._context.new_page()
-        captured: list[dict] = []  # {"url":..., "json":...}
+        captured: list[dict] = []
 
         def on_response(resp):
-            try:
-                u = resp.url
-                if "mtop" not in u and "search" not in u:
-                    return
-                data = resp.json()
-                if isinstance(data, dict):
-                    captured.append({"url": u, "json": data})
-            except Exception:
-                pass
+            j = _safe_json(resp)
+            if j is not None and ("mtop" in resp.url or "search" in resp.url):
+                captured.append(j)
 
         page.on("response", on_response)
         items: list[dict] = []
@@ -216,7 +250,6 @@ class XianyuSession:
                 wait_until="domcontentloaded",
                 timeout=30000,
             )
-            # 滚动加载更多
             for _ in range(SCROLL_ROUNDS):
                 if time.time() > deadline:
                     break
@@ -231,7 +264,6 @@ class XianyuSession:
         if not items:
             raise ScrapeError("未能从闲鱼获取搜索结果（可能未登录或触发反爬验证）")
 
-        # 详情 + 卖家主页补充
         detailed = []
         for it in items[:DETAIL_PAGE_LIMIT]:
             if time.time() > deadline:
@@ -250,131 +282,108 @@ class XianyuSession:
     def _extract_search_items(captured: list[dict]) -> list[dict]:
         seen: set[str] = set()
         items: list[dict] = []
-        for cap in captured:
+        for cap_json in captured:
             raw_list: list[dict] = []
-            _walk(cap["json"], _is_search_item, raw_list, limit=300)
+            _walk(cap_json, _is_search_card, raw_list, limit=300)
             for raw in raw_list:
-                iid = str(_first(raw, ["item_id", "itemId", "id"]) or raw.get("title"))
+                iid = str(raw.get("itemId"))
                 if iid in seen:
                     continue
                 seen.add(iid)
                 items.append({
                     "item_id": iid,
                     "title": str(raw.get("title", "")).strip(),
-                    "price": _parse_price(_first(raw, ["price", "priceWap", "priceString", "salePrice"])),
+                    "price": _card_price(raw),
                     "desc": "",
                     "image_count": 0,
-                    "image_url": _fix_url(str(_first(raw, ["picUrl", "pic", "img", "image", "coverUrl"]) or "") or None),
-                    "url": f"{BASE}/item?id={_first(raw, ['item_id', 'itemId', 'id']) or iid}",
+                    "image_url": _fix_url(str(raw.get("picUrl") or "") or None),
+                    "url": f"{BASE}/item?id={iid}",
                     "seller": {
-                        "id": str(_first(raw, ["userId", "sellerId", "user_id", "seller_id", "ownerId"]) or "") or None,
-                        "nick": None, "good_count": None, "bad_count": None,
+                        "id": None,
+                        "nick": raw.get("userNickName") or None,
+                        "good_count": None, "bad_count": None,
                         "item_count": None, "categories": None, "last_online_days": None,
                     },
                     "pickup": {"is_pickup": False, "location_text": None},
-                    "area": _first(raw, ["area", "city", "location", "areaName"]),
+                    "area": raw.get("area"),
                 })
         return items
 
     def _fetch_detail(self, item: dict, deadline: float) -> dict:
-        """打开商品详情页与卖家主页，抓文案、图片、卖家数据。"""
+        """打开商品详情页，从 mtop.taobao.idle.pc.detail 拿文案/图片/卖家数据。"""
         out: dict = {}
         page = self._context.new_page()
         captured: list[dict] = []
 
         def on_response(resp):
-            try:
-                data = resp.json()
-                if isinstance(data, dict):
-                    captured.append({"url": resp.url, "json": data})
-            except Exception:
-                pass
+            j = _safe_json(resp)
+            if j is not None:
+                captured.append(j)
 
         page.on("response", on_response)
         try:
             page.goto(item["url"], wait_until="domcontentloaded", timeout=20000)
             page.wait_for_timeout(2500)
-            detail_raw: list[dict] = []
-            for cap in captured:
-                _walk(cap["json"], _is_detail, detail_raw, limit=20)
-            if detail_raw:
-                raw = max(detail_raw, key=lambda d: len(str(d.get("desc", ""))))
-                desc = str(_first(raw, ["desc", "description", "itemDesc"]) or "")
-                pics = _first(raw, ["pics", "images", "picList", "photos"]) or []
-                pic_urls = [_fix_url(p if isinstance(p, str) else str(_first(p, ["url", "picUrl", "img"]) or "")) for p in pics]
-                out["desc"] = desc
-                out["image_count"] = len(pics)
-                if pic_urls and not item.get("image_url"):
-                    out["image_url"] = pic_urls[0]
-                sid = _first(raw, ["userId", "sellerId", "user_id", "seller_id"])
-                if sid:
-                    item["seller"]["id"] = str(sid)
-                if not item.get("area"):
-                    out["area"] = _first(raw, ["area", "city", "location"])
-            else:
-                # 兜底：尝试页面内 __INIT_DATA__
-                try:
-                    html = page.content()
-                    m = re.search(r"__INIT_DATA__\s*=\s*(\{.*?\})\s*</script>", html, re.S)
-                    if m:
-                        data = json.loads(m.group(1))
-                        raw_list: list[dict] = []
-                        _walk(data, _is_detail, raw_list, limit=10)
-                        if raw_list:
-                            raw = raw_list[0]
-                            out["desc"] = str(_first(raw, ["desc", "description", "itemDesc"]) or "")
-                except Exception:
-                    pass
+            for j in captured:
+                if j.get("api") != "mtop.taobao.idle.pc.detail":
+                    continue
+                data = j.get("data") or {}
+                item_do = data.get("itemDO") or {}
+                seller_do = data.get("sellerDO") or {}
 
-            # 卖家主页
-            sid = item["seller"].get("id")
-            if sid and time.time() < deadline:
-                captured.clear()
-                try:
-                    page.goto(f"{BASE}/personal_page?id={sid}", wait_until="domcontentloaded", timeout=20000)
-                    page.wait_for_timeout(2500)
-                    self._parse_seller(page, captured, item)
-                except Exception:
-                    pass
+                # 文案与图片
+                desc = str(item_do.get("desc") or "")
+                if desc:
+                    out["desc"] = desc
+                infos = item_do.get("imageInfos") or []
+                urls = [str(i.get("url") or "") for i in infos if isinstance(i, dict)]
+                if urls:
+                    out["image_count"] = len(urls)
+                    if not item.get("image_url"):
+                        out["image_url"] = _fix_url(urls[0])
+
+                # 价格兜底（卡片价缺失时）
+                if item.get("price") is None:
+                    p = _parse_price(item_do.get("soldPrice"))
+                    if p is not None:
+                        out["price"] = p
+
+                # 运费
+                fee = _parse_price(item_do.get("transportFee"))
+                if fee is not None:
+                    out["shipping_fee"] = fee
+
+                # 卖家数据（sellerDO 一站拿全，不再访问卖家主页）
+                seller = item["seller"]
+                if not seller.get("id") and seller_do.get("sellerId"):
+                    seller["id"] = str(seller_do["sellerId"])
+                if not seller.get("nick") and seller_do.get("nick"):
+                    seller["nick"] = str(seller_do["nick"])
+                s_items = seller_do.get("sellerItems") or []
+                if s_items:
+                    seller["item_count"] = len(s_items)
+                sold = seller_do.get("hasSoldNumInteger")
+                seller["sold_count"] = int(sold) if str(sold or "").isdigit() else None
+                seller["zhima_auth"] = bool(seller_do.get("zhimaAuth"))
+                seller["reply_ratio"] = seller_do.get("replyRatio24h")
+                seller["last_online_days"] = _parse_last_visit(str(seller_do.get("lastVisitTime") or ""))
+
+                if not item.get("area") and seller_do.get("city"):
+                    out["area"] = seller_do["city"]
+
+                # 自提识别：文案提到自提 → 用卖家城市作为自提位置
+                text = f"{item['title']} {desc}"
+                if not item["pickup"].get("is_pickup"):
+                    strong = re.search(r"仅.{0,6}自提|只(支持)?.{0,3}自提|自提.{0,4}优先|"
+                                       r"不(包)?邮(寄)?|仅限.{0,10}自提|不支持邮寄|同城自提", text)
+                    weak = "自提" in text and not re.search(r"快递|邮寄|包邮|到付|可邮", text)
+                    if strong or weak:
+                        out["pickup"] = {"is_pickup": True,
+                                         "location_text": str(seller_do.get("city") or item.get("area") or "")}
+                break
         finally:
             page.close()
         return out
-
-    @staticmethod
-    def _parse_seller(page, captured: list[dict], item: dict) -> None:
-        seller = item["seller"]
-        # 在售商品数与类目
-        raw_items: list[dict] = []
-        for cap in captured:
-            _walk(cap["json"], _is_search_item, raw_items, limit=200)
-        if raw_items:
-            seller["item_count"] = len(raw_items)
-            cats = []
-            for r in raw_items:
-                c = _first(r, ["category", "catName", "categoryName"])
-                if c:
-                    cats.append(str(c))
-            seller["categories"] = cats or None
-            if not seller.get("nick"):
-                for r in raw_items[:3]:
-                    n = _first(r, ["userNick", "sellerNick", "nick", "userName"])
-                    if n:
-                        seller["nick"] = str(n)
-                        break
-        # 最近上线时间：从页面文本解析「x天前来过 / 今天来过 / x小时前」
-        try:
-            text = page.inner_text("body")
-            m = re.search(r"(\d+)\s*天前\s*来过", text)
-            if m:
-                seller["last_online_days"] = float(m.group(1))
-            elif re.search(r"今天来过|昨天来过|小时前|分钟前|刚刚", text):
-                seller["last_online_days"] = 0.0
-            else:
-                m2 = re.search(r"(\d+)\s*周前\s*来过", text)
-                if m2:
-                    seller["last_online_days"] = float(m2.group(1)) * 7
-        except Exception:
-            pass
 
 
 session = XianyuSession()

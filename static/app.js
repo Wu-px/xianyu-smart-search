@@ -182,6 +182,7 @@ function renderCards() {
     if (seller.last_online_days != null)
       meta.push(seller.last_online_days <= 0.5 ? "今天上线" : `${Math.round(seller.last_online_days)} 天前上线`);
     if (f.pickup && f.pickup.fee_note) meta.push(escapeHtml(f.pickup.fee_note));
+    if (it.shipping_fee != null) meta.push(it.shipping_fee <= 0.5 ? "卖家包邮" : `运费约 ¥${it.shipping_fee}`);
     if (it.area) meta.push(`发布地：${escapeHtml(it.area)}`);
 
     div.innerHTML = `

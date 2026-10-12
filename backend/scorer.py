@@ -5,8 +5,8 @@
 
 - 同款商品价格横向比较（明显偏高的降权）
 - 品相完好程度（从文案关键词解析：全新/99新/95新/…/瑕疵暗病）
-- 卖家信誉（好评率 + 评价数量）
-- 个人卖家优先（主页商品少、类目杂 = 个人闲置；专卖同一类目 = 商家降权）
+- 卖家信誉（好评率 + 评价数量；网页版拿不到评价数时用芝麻信用 + 已售数代理）
+- 个人卖家优先（主页商品少、类目杂 = 个人闲置；已售数量大 / 专卖同一类目 = 商家降权）
 - 文案质量（文案越长、图片越多越加分）
 - 需私聊问价的商品：单独标记，价格不计入比价
 - 自提商品：从文案提取位置，按同城/同区粗估距离与运费
@@ -183,30 +183,45 @@ def score_items(items: list[dict], city: str, district: str) -> list[dict]:
             else:
                 reasons.append({"type": "note", "text": f"卖家好评率 {pct}"})
         else:
-            r_score = 0.6
-            reasons.append({"type": "note", "text": "卖家评价数据不可见，建议先看主页评价"})
+            # 网页版拿不到好差评数时，用芝麻信用认证 + 已售出数量做信誉代理
+            zhima = seller.get("zhima_auth")
+            sold = seller.get("sold_count") or 0
+            if zhima:
+                r_score = min(0.9, 0.7 + sold / 200)
+                reasons.append({"type": "plus", "text": f"芝麻信用认证，已售出 {sold} 件" +
+                                (f"，24h 回复率 {seller['reply_ratio']}" if seller.get("reply_ratio") else "")})
+            else:
+                r_score = 0.6
+                reasons.append({"type": "note", "text": "卖家评价数据不可见，建议先看主页评价"})
 
         # ---- 个人卖家 or 商家 ----
         count = seller.get("item_count")
         cats = seller.get("categories")
+        sold = seller.get("sold_count") or 0
         diversity = len(set(cats)) if cats else None
-        if count is not None:
-            div_ok = diversity is not None
-            if (count >= 50 and (not cats or diversity <= 2)) or (count >= 30 and div_ok and diversity <= 1):
-                per_score = 0.2
-                flags["merchant"] = True
-                reasons.append({"type": "minus", "text": f"主页在售 {count} 件且品类单一，疑似职业商家"})
-            elif count <= 15 or (div_ok and diversity >= 3):
-                per_score = 1.0
-                flags["personal"] = True
-                reasons.append({"type": "plus", "text": f"个人卖家（主页在售 {count} 件，多为个人闲置）"})
+        div_ok = diversity is not None
+        # 已售数量是最强的商家信号（sellerItems 只返回第一页，在售数会低估）
+        if sold >= 50 or (count is not None and ((count >= 50 and (not cats or diversity <= 2))
+                                                   or (count >= 30 and div_ok and diversity <= 1))):
+            per_score = 0.2
+            flags["merchant"] = True
+            if sold >= 100:
+                reasons.append({"type": "minus", "text": f"已售出 {sold} 件，疑似职业商家"})
+            elif sold >= 50:
+                reasons.append({"type": "minus", "text": f"已售出 {sold} 件，偏向商家"})
             else:
-                per_score = 0.6
-                flags["maybe_merchant"] = True
-                reasons.append({"type": "note", "text": f"卖家在售 {count} 件，可能半职业"})
-        else:
+                reasons.append({"type": "minus", "text": f"主页在售 {count} 件且品类单一，疑似职业商家"})
+        elif count is not None and (count <= 15 or (div_ok and diversity >= 3)):
+            per_score = 1.0
+            flags["personal"] = True
+            reasons.append({"type": "plus", "text": f"个人卖家（主页在售 {count} 件，多为个人闲置）"})
+        elif count is None:
             per_score = 0.6
             reasons.append({"type": "note", "text": "无法判断卖家类型"})
+        else:
+            per_score = 0.6
+            flags["maybe_merchant"] = True
+            reasons.append({"type": "note", "text": f"卖家在售 {count} 件，可能半职业"})
 
         # ---- 文案质量 ----
         d_len = len(desc or "")
@@ -234,7 +249,22 @@ def score_items(items: list[dict], city: str, district: str) -> list[dict]:
                 pk_score = 0.2
                 reasons.append({"type": "minus", "text": pickup_info["fee_note"]})
         else:
-            pk_score = 0.9  # 普通快递，默认运费可控
+            # 普通快递：有运费数据时按费用高低微调
+            fee = it.get("shipping_fee")
+            if fee is None:
+                pk_score = 0.9
+            elif fee <= 0.5:
+                pk_score = 1.0
+                reasons.append({"type": "plus", "text": "卖家包邮"})
+            elif fee <= 8:
+                pk_score = 1.0
+                reasons.append({"type": "plus", "text": f"运费约 ¥{fee:g}，较低"})
+            elif fee <= 15:
+                pk_score = 0.8
+                reasons.append({"type": "note", "text": f"运费约 ¥{fee:g}"})
+            else:
+                pk_score = 0.6
+                reasons.append({"type": "minus", "text": f"运费约 ¥{fee:g}，偏高"})
 
         # ---- 上线时间 ----
         days = seller.get("last_online_days")
