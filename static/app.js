@@ -86,7 +86,7 @@ async function doSearch() {
     state.items = data.items;
     state.source = data.source;
     state.note = data.note;
-    renderResults();
+    renderResults(data);
   } catch (e) {
     alert("搜索失败：" + e.message);
   } finally {
@@ -119,9 +119,10 @@ function sortedItems() {
 }
 
 /* ---------------- 渲染 ---------------- */
-function renderResults() {
+function renderResults(data) {
   $("results").classList.remove("hidden");
-  $("result-count").textContent = `共 ${state.items.length} 件 · 「${state.keyword}」`;
+  $("result-count").textContent = `共 ${state.items.length} 件 · 「${state.keyword}」` +
+    (data.excluded_wtb ? ` · 已排除 ${data.excluded_wtb} 条求购/收购帖` : "");
   const badge = $("source-badge");
   if (state.source === "demo") {
     badge.textContent = "演示数据（真实抓取失败时自动降级）";

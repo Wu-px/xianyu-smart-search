@@ -84,9 +84,13 @@ def api_search(req: SearchReq):
         raw = mock_data.generate(keyword, city, district)
 
     scored = score_items(raw, city, district)
+    # 求购/收购帖：对方是买家，价格无比较意义，整体排除（仅计数提示）
+    excluded_wtb = sum(1 for it in scored if it["flags"].get("want_to_buy"))
+    scored = [it for it in scored if not it["flags"].get("want_to_buy")]
     result = sort_items(scored, "value")
     return {"source": source, "note": note, "keyword": keyword,
-            "city": city, "district": district, "items": result}
+            "city": city, "district": district, "excluded_wtb": excluded_wtb,
+            "items": result}
 
 
 # ---------------------------------------------------------------- 静态页面（挂到最后，避免挡住 /api）

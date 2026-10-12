@@ -9,6 +9,7 @@
 - 个人卖家优先（主页商品少、类目杂 = 个人闲置；已售数量大 / 专卖同一类目 = 商家降权）
 - 文案质量（文案越长、图片越多越加分）
 - 需私聊问价的商品：单独标记，价格不计入比价
+- 求购/收购/回收帖：对方是买家，整体排除，不参与评分与排序
 - 自提商品：从文案提取位置，按同城/同区粗估距离与运费
 - 卖家超过 10 天未上线：不淘汰，但标记「不推荐」并固定排在最后
 
@@ -42,6 +43,10 @@ CONDITION_RULES = [
 ]
 
 ASK_PRICE_RE = re.compile(r"私聊问价|问价私|价格私|询价|详询|价格面议|面议|带价来|有意私|价私")
+
+# 求购 / 收购 / 回收帖：对方是买家，标的价格是「愿意出的收购价」，必须排除
+WTB_RE = re.compile(r"求购|收购|回收|大量收|高价收|诚心收|长期收|上门收|现金收|现收|"
+                    r"收[一二两三四五六七八九十\d]{0,3}\s*[一个台件只把部条]")
 
 SHIPPING_NOTE = "快递发货，运费以下单页为准"
 
@@ -126,6 +131,9 @@ def score_items(items: list[dict], city: str, district: str) -> list[dict]:
         price = it.get("price")
         reasons: list[dict] = []
         flags = it["flags"]
+
+        # ---- 求购/收购帖（上层会整体过滤，这里只打标记） ----
+        flags["want_to_buy"] = bool(WTB_RE.search(title)) or bool(it.get("wtb_hint"))
 
         # ---- 私聊问价 ----
         ask = detect_ask_price(price, desc, title)

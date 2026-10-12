@@ -205,11 +205,9 @@ class XianyuSession:
         try:
             page.goto(BASE + "/", wait_until="domcontentloaded", timeout=20000)
             page.wait_for_timeout(3500)
-            saw_login_api = False
             for j in captured:
                 api = str(j.get("api", ""))
                 if "loginuser" in api or "user.page.nav" in api:
-                    saw_login_api = True
                     ret = ",".join(j.get("ret") or [])
                     if "SUCCESS" in ret:
                         nick = None
@@ -298,6 +296,7 @@ class XianyuSession:
                     "image_count": 0,
                     "image_url": _fix_url(str(raw.get("picUrl") or "") or None),
                     "url": f"{BASE}/item?id={iid}",
+                    "wtb_hint": "求购" in (str(raw.get("fishTags") or "") + str(raw.get("title") or "")),
                     "seller": {
                         "id": None,
                         "nick": raw.get("userNickName") or None,
